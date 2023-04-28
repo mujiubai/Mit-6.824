@@ -74,23 +74,23 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh *chan ApplyMsg
+	applyCh *chan ApplyMsg //通过此通道提交日志和snapshot
 
 	//persistent state
-	currentTerm int
-	votedFor    int
-	log         []Entry
+	currentTerm int     //当前term
+	votedFor    int     //当前投票给谁
+	log         []Entry //日志信息
 
 	//Volatile state
-	state        int
-	lastRecTime  int64
-	commitIndex  int //当前日志待提交的序号
-	lastApplied  int //已提交日志的序号
-	lastLogIndex int //最后一个日志序号
+	state        int   //当前raft的状态：follower、candidate、leader之一
+	lastRecTime  int64 //当前raft最后一次收到消息时间，毫秒时间戳
+	commitIndex  int   //当前日志待提交的序号
+	lastApplied  int   //已提交日志的序号
+	lastLogIndex int   //最后一个日志序号
 
 	//Reinitialized after election
-	nextIndex  []int
-	matchIndex []int
+	nextIndex  []int //所有raft的下一个要发送日志的位置
+	matchIndex []int //和其他raft成功匹配的日志位置
 }
 
 // return currentTerm and whether this server
@@ -116,15 +116,6 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
-
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -163,20 +154,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastLogIndex = len(rf.log) - 1
 		rf.mu.Unlock()
 	}
-
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
 // the service says it has created a snapshot that has
@@ -192,36 +169,36 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
+	Term         int //rpc发起者的term
+	CandidateId  int //rpc发起者的序号
+	LastLogIndex int //rpc发起者的最后一个日志的序号
+	LastLogTerm  int //rpc发起者的最后一个日志的term
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
-	VoteGranted bool
+	Term        int  //被调用者的当前term
+	VoteGranted bool //被调用者是否同意投票给调用者
 }
 
 type RequestAppendArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Entry
-	LeaderCommit int
+	Term         int     //发起者当前term
+	LeaderId     int     //发起者id
+	PrevLogIndex int     //当前要添加日志的前一个日志位置
+	PrevLogTerm  int     //当前要添加日志的前一个日志的term
+	Entries      []Entry //要添加的日志
+	LeaderCommit int     //发起者的commit大小，主要用于接受者提交日志
 }
 
 type RequestAppendReply struct {
 	// Your data here (2A, 2B).
-	Term       int
-	Success    bool
-	FailReason string
-	UpdateNext int
+	Term       int    //接收方当前term
+	Success    bool   //是否成功添加日志
+	FailReason string //添加失败的原因，有点多余这参数，
+	UpdateNext int    //添加失败，即日志冲突时，需要将leader的nextIndex更新为UpdateNext
 }
 
 // example RequestVote RPC handler.
@@ -235,17 +212,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term >= rf.currentTerm {
 		if args.Term > rf.currentTerm {
 			rf.votedFor = -1
-			rf.state = follower
-			rf.currentTerm = args.Term
 		}
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 			curLogIdx := rf.lastLogIndex
 			curLogTerm := rf.log[curLogIdx].Term
-
+			rf.state = follower
+			rf.currentTerm = args.Term
 			if (args.LastLogTerm > curLogTerm) || (args.LastLogTerm == curLogTerm && args.LastLogIndex >= curLogIdx) {
 				rf.votedFor = args.CandidateId
-				rf.state = follower
-				rf.currentTerm = args.Term
 				reply.VoteGranted = true
 				DPrintf("raft:[%v] term:%v agree the vote from raft%v", rf.me, rf.currentTerm, args.CandidateId)
 			}
@@ -253,24 +227,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.persist()
 	}
-
-	// if args.Term > rf.currentTerm {
-	// 	rf.currentTerm = args.Term
-	// 	DPrintf("raft:[%v] term:%v change state to follower when vote term > curterm,args term=%v", rf.me, rf.currentTerm, args.Term)
-	// 	rf.state = follower
-	// 	rf.votedFor = args.CandidateId
-	// 	reply.VoteGranted = true
-	// } else if args.Term == rf.currentTerm {
-	// 	if rf.votedFor == -1 {
-	// 		rf.votedFor = args.CandidateId
-	// 		rf.state = follower
-	// 		DPrintf("raft:[%v] term:%v change state to followerwhen vote term == curterm", rf.me, rf.currentTerm)
-	// 		reply.VoteGranted = true
-	// 	}
-	// }
 	reply.Term = rf.currentTerm
 }
 
+//根据lastApplied和commitIndex提交日志
 func (rf *Raft) commitEntry() {
 	if rf.commitIndex > rf.lastApplied {
 		DPrintf("raft:[%v] term:%v, commit entry from %v to %v", rf.me, rf.currentTerm, rf.lastApplied+1, rf.commitIndex)
@@ -280,20 +240,6 @@ func (rf *Raft) commitEntry() {
 			rf.lastApplied++
 		}
 	}
-
-	// targetCommit := rf.lastApplied
-	// DPrintf("raft:[%v] term:%v,rf.lastApplied=%v, leaderCommit=%v", rf.me, rf.currentTerm, rf.lastApplied, leaderCommit)
-	// if targetCommit > leaderCommit {
-	// 	targetCommit = leaderCommit
-	// }
-	// if rf.commitIndex+1 >= targetCommit {
-	// 	DPrintf("raft:[%v] term:%v, commit entry from %v to %v", rf.me, rf.currentTerm, rf.commitIndex+1, targetCommit)
-	// }
-	// for i := rf.commitIndex + 1; i <= targetCommit; i++ {
-	// 	tmpMsg := ApplyMsg{true, rf.log[i].Command, i, false, nil, -1, -1}
-	// 	*rf.applyCh <- tmpMsg
-	// 	rf.commitIndex++
-	// }
 }
 
 func min(a int, b int) int {
@@ -334,44 +280,51 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 		reply.Term = rf.currentTerm
 		return
 	}
-	//如果当前日志中不包含args中的上一个日志序号即term，返回false
 	if args.PrevLogIndex >= 0 {
-		//长度不够或term不匹配
+		//长度不够或term不匹配, 如果当前日志中不包含args中的上一个日志序号即term，返回false
 		if rf.lastLogIndex < args.PrevLogIndex || (rf.lastLogIndex >= args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 			if rf.lastLogIndex < args.PrevLogIndex {
 				reply.UpdateNext = rf.lastLogIndex
 			} else {
-				reply.UpdateNext = args.PrevLogIndex - 1
+				tmpIdx := args.PrevLogIndex
+				for tmpIdx > 0 && rf.log[tmpIdx-1].Term == rf.log[args.PrevLogIndex].Term {
+					tmpIdx--
+				}
+				reply.UpdateNext = tmpIdx
 			}
-			reply.UpdateNext = 1
+			//主要是为了避免rf.lastLogInde为0的情况：即服务器新加入等情况
+			if reply.UpdateNext == 0 {
+				reply.UpdateNext = 1
+			}
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			reply.FailReason = "inconsistency"
 			DPrintf("raft:[%v] term:%v, dont match the args PrevLogIndex or PrevLogTerm", rf.me, rf.currentTerm)
 			return
 		}
-	}
-	//如果新增日志序号存在但冲突则删除后面日志，序号不存在添加到末端
-	ia := 0
-	for i := args.PrevLogIndex + 1; i <= rf.lastLogIndex; i++ {
-		if rf.log[i].Term != args.Entries[ia].Term {
-			rf.log = rf.log[:i]
-			break
+		//如果新增日志序号存在但冲突则删除后面日志，序号不存在添加到末端
+		ia := 0
+		for i := args.PrevLogIndex + 1; i <= rf.lastLogIndex; i++ {
+			if rf.log[i].Term != args.Entries[ia].Term {
+				rf.log = rf.log[:i]
+				break
+			}
+			ia++
 		}
-		ia++
-	}
-	if ia < len(args.Entries) {
-		rf.log = append(rf.log, args.Entries[ia:]...)
-	}
-	rf.lastLogIndex = len(rf.log) - 1
-	DPrintf("raft:[%v] term:%v, add entries to %v success", rf.me, rf.currentTerm, rf.lastLogIndex)
+		if ia < len(args.Entries) {
+			rf.log = append(rf.log, args.Entries[ia:]...)
+		}
+		rf.lastLogIndex = len(rf.log) - 1
+		DPrintf("raft:[%v] term:%v, add entries to %v success", rf.me, rf.currentTerm, rf.lastLogIndex)
 
-	rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex)
-	rf.commitEntry()
-	reply.Success = true
-	reply.Term = rf.currentTerm
-	DPrintf("raft:[%v] term:%v, apply entries to %v", rf.me, rf.currentTerm, rf.lastApplied)
-	rf.persist()
+		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex)
+		rf.commitEntry()
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		DPrintf("raft:[%v] term:%v, apply entries to %v", rf.me, rf.currentTerm, rf.lastApplied)
+		rf.persist()
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -423,7 +376,7 @@ func (rf *Raft) syncAllEntries() {
 			rf.mu.Unlock()
 			for {
 				rf.mu.Lock()
-				if term != rf.currentTerm || rf.state != leader {
+				if term != rf.currentTerm || rf.state != leader || rf.killed() {
 					rf.mu.Unlock()
 					return
 				}
@@ -442,7 +395,8 @@ func (rf *Raft) syncAllEntries() {
 					rf.sendAppendEntries(i, &args, &reply)
 
 					rf.mu.Lock()
-					if rf.currentTerm != term || rf.state != leader { //当被新选举为leader时
+					//当被新选举为leader时
+					if rf.currentTerm != term || rf.state != leader {
 						rf.mu.Unlock()
 						return
 					}
@@ -452,10 +406,13 @@ func (rf *Raft) syncAllEntries() {
 						DPrintf("raft:[%v] term:%v, sync entries to raft%v success, nextIndex=%v", rf.me, rf.currentTerm, i, rf.nextIndex[i])
 					} else {
 						if reply.FailReason == "inconsistency" {
-							rf.nextIndex[i]--
+							// rf.nextIndex[i]--
 							rf.nextIndex[i] = reply.UpdateNext
 							DPrintf("raft:[%v] term:%v, sync entries to raft%v fail, the reason is inconsistency, nextIndex=%v", rf.me, rf.currentTerm, i, rf.nextIndex[i])
 						} else if reply.FailReason == "oldterm" {
+							rf.currentTerm = reply.Term
+							rf.votedFor = -1
+							rf.state = follower
 							DPrintf("raft:[%v] term:%v, sync entries to raft%v fail, the reason is oldterm, nextIndex=%v", rf.me, rf.currentTerm, i, rf.nextIndex[i])
 							rf.mu.Unlock()
 							break
@@ -489,6 +446,8 @@ func (rf *Raft) syncAllEntries() {
 						}
 					}
 					if count > len(rf.peers)/2 {
+						//为了避免论文Fig8出现的问题，对于日志只能直接确认当前term的日志，而其他term的日志只能通过确认当前term日志来间接性确认
+						//例如确认index为3的日志，那么3以前的日志也会被间接性确认
 						if rf.log[N].Term == rf.currentTerm {
 							rf.commitIndex = N
 							rf.commitEntry()
@@ -497,11 +456,52 @@ func (rf *Raft) syncAllEntries() {
 					}
 				}
 				rf.mu.Unlock()
-
-				time.Sleep(time.Duration(100) * time.Microsecond)
+				//使用条件变量的话有个点还没想好怎么解决：如果不再为leader，又没有对条件变量进行操作，则会卡死在这
+				time.Sleep(time.Duration(10) * time.Microsecond)
 			}
-
 		}(idx)
+	}
+}
+
+func (rf *Raft) sendAllHeartBeat(curTerm int) {
+	for {
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		// state := rf.state
+		if rf.state != leader || curTerm < rf.currentTerm {
+			DPrintf("rf %v is not leader, state=, break heart beat%v", rf.me, rf.state)
+			rf.mu.Unlock()
+			return
+		}
+		DPrintf("raft:[%v] term:%v is leader, send heart beat to all servers-------------------------", rf.me, rf.currentTerm)
+		rf.lastRecTime = time.Now().UnixNano() / 1e6
+		rf.mu.Unlock()
+
+		for idx, _ := range rf.peers {
+			if idx == rf.me {
+				continue
+			}
+			//发送心跳时，如果当前日志还未同步完成，直接发送commitIndex会导致错误提交，因此sendCommitIndex=min(lastApplied,matchIndex[idx])
+			go func(idx int) {
+				rf.mu.Lock()
+				sendCommitIndex := min(rf.lastApplied, rf.matchIndex[idx])
+				args := RequestAppendArgs{rf.currentTerm, rf.me, -1, -1, nil, sendCommitIndex}
+				reply := RequestAppendReply{}
+				rf.mu.Unlock()
+
+				rf.sendAppendEntries(idx, &args, &reply)
+				rf.mu.Lock()
+				if (!reply.Success) && reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					DPrintf("raft:[%v] term:%v change state to follower when send the heartbeat find big term, send to raft=%v", rf.me, rf.currentTerm, idx)
+					rf.state = follower
+				}
+				rf.mu.Unlock()
+			}(idx)
+		}
+		time.Sleep(time.Duration(150) * time.Millisecond)
 	}
 }
 
@@ -562,48 +562,6 @@ func (rf *Raft) startElect() {
 			}
 			rf.mu.Unlock()
 		}(a)
-	}
-}
-
-func (rf *Raft) sendAllHeartBeat(curTerm int) {
-	for {
-		if rf.killed() {
-			return
-		}
-		rf.mu.Lock()
-		// state := rf.state
-		if rf.state != leader || curTerm < rf.currentTerm {
-			DPrintf("rf %v is not leader, state=, break heart beat%v", rf.me, rf.state)
-			rf.mu.Unlock()
-			return
-		}
-		DPrintf("raft:[%v] term:%v is leader, send heart beat to all servers-------------------------", rf.me, rf.currentTerm)
-		rf.lastRecTime = time.Now().UnixNano() / 1e6
-		rf.mu.Unlock()
-
-		for idx, _ := range rf.peers {
-			if idx == rf.me {
-				continue
-			}
-			//发送心跳时，如果当前日志还未同步完成，直接发送commitIndex会导致错误提交，因此sendCommitIndex=min(lastApplied,matchIndex[idx])
-			go func(idx int) {
-				rf.mu.Lock()
-				sendCommitIndex := min(rf.lastApplied, rf.matchIndex[idx])
-				args := RequestAppendArgs{rf.currentTerm, rf.me, -1, -1, nil, sendCommitIndex}
-				reply := RequestAppendReply{}
-				rf.mu.Unlock()
-
-				rf.sendAppendEntries(idx, &args, &reply)
-				rf.mu.Lock()
-				if (!reply.Success) && reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					DPrintf("raft:[%v] term:%v change state to follower when send the heartbeat find big term, send to raft=%v", rf.me, rf.currentTerm, idx)
-					rf.state = follower
-				}
-				rf.mu.Unlock()
-			}(idx)
-		}
-		time.Sleep(time.Duration(150) * time.Millisecond)
 	}
 }
 
