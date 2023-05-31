@@ -100,6 +100,16 @@ type Raft struct {
 	commitEntryChan chan bool //当需要提交日志时，向此通道发送一个信号
 }
 
+//向commitEntryChan中发送一个信号
+func (rf *Raft) toCommitEntryChan() {
+	rf.commitEntryChan <- true
+}
+
+//向sendMsgChan中发送一个信号
+func (rf *Raft) toSendMsgChan() {
+	rf.sendMsgChan <- true
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -180,6 +190,17 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+//获取当前日志大小，共kvraft等调用
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetRaftLastIncludedIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastIncludedIndex
+}
+
 func (rf *Raft) dealApplyMsg(msg *ApplyMsg) {
 	*rf.applyCh <- *msg
 	DPrintf("raft:[%v] restore snapdata success! rf.lastApplied=%v", rf.me, rf.lastApplied)
@@ -190,10 +211,11 @@ func (rf *Raft) dealApplyMsg(msg *ApplyMsg) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	DPrintf("raft:[%v] get a new snapshot---", rf.me)
 	// Your code here (2D).
 	rf.mu.Lock()
-	if index <= rf.lastIncludedIndex {
+	DPrintf("raft:[%v] get a new snapshot---, index=%v, rf.lastIncludedIndex=%v, rf.log size=%v", rf.me, index, rf.lastIncludedIndex, len(rf.log))
+	//后面部分条件主要是因为kv检测到需要发送Snapshot时，调用Snapshot函数，但此时raft底层从主raft收到安装镜像调用，将log进行修改，此时就会发生错误。
+	if index <= rf.lastIncludedIndex || index-rf.lastIncludedIndex >= len(rf.log) {
 		rf.mu.Unlock()
 		return
 	}
@@ -246,7 +268,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 }
 
-
 //根据lastApplied和commitIndex提交日志
 func (rf *Raft) commitEntryLoop() {
 	for !rf.killed() {
@@ -254,8 +275,6 @@ func (rf *Raft) commitEntryLoop() {
 		case <-time.After(time.Duration(50) * time.Millisecond):
 		case <-rf.commitEntryChan:
 		}
-		// tmp := <-rf.commitEntryChan
-		// DPrintf("raft:[%v] term:%v, get commitEntryChan, value=%v", rf.me, rf.currentTerm, tmp)
 		rf.mu.Lock()
 		if rf.commitIndex <= rf.lastApplied {
 			// DPrintf("raft:[%v] term:%v, dont need submit entry, commitIndex=%v, lastApplied=%v", rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied)
@@ -268,8 +287,8 @@ func (rf *Raft) commitEntryLoop() {
 				DPrintf("raft:[%v] term:%v, prepare submit msg=%v", rf.me, rf.currentTerm, tmpMsg)
 				rf.mu.Unlock()
 				*rf.applyCh <- tmpMsg
-				DPrintf("raft:[%v] term:%v, success submit msg=%v", rf.me, rf.currentTerm, tmpMsg)
 				rf.mu.Lock()
+				DPrintf("raft:[%v] term:%v, success submit msg=%v", rf.me, rf.currentTerm, tmpMsg)
 				//防止lastApplied被更改变大，如完成安装镜像
 				if rf.lastApplied < tmpMsg.CommandIndex {
 					rf.lastApplied = tmpMsg.CommandIndex
@@ -292,8 +311,9 @@ func min(a int, b int) int {
 }
 
 func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply) {
-	DPrintf("raft:[%v] term:%v get a AppendEntries rpc", rf.me, rf.currentTerm)
+	DPrintf("raft:[%v] term:%v get a AppendEntries rpc, log=%v", rf.me, rf.currentTerm, args.Entries)
 	rf.mu.Lock()
+	DPrintf("raft:[%v] term:%v get a AppendEntries rpc, log=%v", rf.me, rf.currentTerm, args.Entries)
 	defer rf.mu.Unlock()
 	// DPrintf("raft:[%v] term:%v accept append entries from raft%v term%v", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 
@@ -317,7 +337,8 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 		if args.LeaderCommit > rf.lastApplied {
 			rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex)
 			// go rf.commitEntry() //心跳时 如果leadercommit有更新则需检测提交
-			rf.commitEntryChan <- true
+			// rf.commitEntryChan <- true
+			go rf.toCommitEntryChan()
 		}
 		reply.Success = true
 		reply.Term = rf.currentTerm
@@ -364,13 +385,15 @@ func (rf *Raft) AppendEntries(args *RequestAppendArgs, reply *RequestAppendReply
 		}
 		if ia < len(args.Entries) {
 			rf.log = append(rf.log, args.Entries[ia:]...)
+			DPrintf("raft:[%v] term:%v, add entries=%v", rf.me, rf.currentTerm, args.Entries[ia:])
 		}
 		rf.lastLogIndex = len(rf.log) - 1 + rf.lastIncludedIndex
 		DPrintf("raft:[%v] term:%v, add entries to %v success", rf.me, rf.currentTerm, rf.lastLogIndex)
 
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex)
 		// go rf.commitEntry()
-		rf.commitEntryChan <- true
+		// rf.commitEntryChan <- true
+		go rf.toCommitEntryChan()
 		reply.Success = true
 		reply.Term = rf.currentTerm
 		DPrintf("raft:[%v] term:%v, apply entries to %v", rf.me, rf.currentTerm, rf.lastApplied)
@@ -541,15 +564,16 @@ func (rf *Raft) syncLoop(curTerm int) {
 							continue
 						}
 						//传commitIndex还是rf.lastApplied还待测试
-						args := RequestAppendArgs{rf.currentTerm, rf.me, rf.nextIndex[i] - 1, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex-1].Term, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex:], rf.commitIndex}
+						entry := make([]Entry, len(rf.log)-(rf.nextIndex[i]-rf.lastIncludedIndex))
+						copy(entry, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex:])
+						args := RequestAppendArgs{rf.currentTerm, rf.me, rf.nextIndex[i] - 1, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex-1].Term, entry, rf.commitIndex}
 						reply := RequestAppendReply{} //{0, false, "test", 0} //{0, false, ""}
 						tmpTime := rf.lastRecTime
-						DPrintf("raft:[%v] term:%v, sending sync entries%v~%v to raft%v !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! %v", rf.me, rf.currentTerm, rf.nextIndex[i], rf.lastLogIndex, i, tmpTime)
+						DPrintf("raft:[%v] term:%v, sending sync entries%v~%v to raft%v !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! rf.lastIncludedIndex=%v, time=%v, \nargs.log=%v ", rf.me, rf.currentTerm, rf.nextIndex[i], rf.lastLogIndex, i, rf.lastIncludedIndex, tmpTime, args.Entries)
 						rf.mu.Unlock()
 						rf.sendAppendEntries(i, &args, &reply)
-
-						DPrintf("raft:[%v] term:%v, get res, the Success=%v, the FailReason=%v", rf.me, rf.currentTerm, reply.Success, reply.FailReason)
 						rf.mu.Lock()
+						DPrintf("raft:[%v] term:%v, get res, the Success=%v, the FailReason=%v,time=%v, \n args.log=%v", rf.me, rf.currentTerm, reply.Success, reply.FailReason, tmpTime, args.Entries)
 						//当被新选举为leader时
 						if rf.currentTerm != curTerm || rf.state != leader {
 							DPrintf("raft:[%v] term:%v, is not leader, sync stop", rf.me, rf.currentTerm)
@@ -603,7 +627,8 @@ func (rf *Raft) syncLoop(curTerm int) {
 								DPrintf("raft:[%v] term:%v, success apply", rf.me, rf.currentTerm)
 								rf.commitIndex = N
 								// go rf.commitEntry()
-								rf.commitEntryChan <- true
+								// rf.commitEntryChan <- true
+								go rf.toCommitEntryChan()
 							}
 							break
 						}
@@ -647,7 +672,9 @@ func (rf *Raft) startElect() {
 			DPrintf("raft:[%v] term:%v, send vote to raft %v, args term=%v", rf.me, rf.currentTerm, idx, args.Term)
 			rf.mu.Unlock()
 			rf.sendRequestVote(idx, &args, &reply)
+			rf.mu.Lock()
 			DPrintf("raft:[%v] term:%v, send vote to raft %v, args term=%v, reply=%v", rf.me, rf.currentTerm, idx, args.Term, reply)
+			rf.mu.Unlock()
 			// DPrintf("raft:%v, vote raft:%v, VoteGranted:%v", rf.me, idx, reply.VoteGranted)
 			if reply.VoteGranted {
 				temMu.Lock()
@@ -714,12 +741,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		DPrintf("raft:[%v] term:%v, start a new command%v entry!!!!!!!!!!!!!!!!!!", rf.me, rf.currentTerm, command)
 		rf.persist()
+		go rf.toSendMsgChan()
 		// go rf.sendAllEntries(index)
 		// go rf.syncAllEntries()
 	} else {
 		isLeader = false
 	}
-	DPrintf("raft:[%v] term:%v, start function: index=%v term=%v isLeader=%v", rf.me, rf.currentTerm, index, term, isLeader)
+	// DPrintf("raft:[%v] term:%v, start function: index=%v term=%v isLeader=%v", rf.me, rf.currentTerm, index, term, isLeader)
 
 	return index, term, isLeader
 }
