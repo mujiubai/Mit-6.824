@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 
 	"6.5840/labrpc"
 )
@@ -10,9 +11,10 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	LeaderId int
-	Seq      int
-	ClientId int64
+	me        int64
+	requestId int
+	leaderId  int64
+	mu        sync.Mutex
 }
 
 func nrand() int64 {
@@ -26,8 +28,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	ck.ClientId = nrand()
-	ck.Seq = 1
+	ck.leaderId = 0
+	ck.requestId = 0
+	ck.me = nrand()
 	return ck
 }
 
@@ -42,8 +45,39 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	return ck.CmdRequst(&CommandArgs{Key: key, Value: "", Op: "Get"})
+
 	// You will have to modify this function.
+	ck.mu.Lock()
+	ck.requestId++
+	ck.mu.Unlock()
+	serverId := ck.leaderId
+	args := GetArgs{key, ck.me, ck.requestId}
+	DPrintf("ck[%v] send Get rpc..., args=%v", ck.me, args)
+	for {
+		// DPrintf("ck[%v] resend Get rpc..., args=%v", ck.me, args)
+		reply := GetReply{}
+		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply)
+		// DPrintf("ck[%v] resend Get rpc..., args=%v, reply=%v", ck.me, args, reply)
+		if (!ok) || reply.Err == ErrWrongLeader {
+			serverId = (serverId + 1) % int64(len(ck.servers))
+			continue
+		}
+		if reply.Err == ErrNoKey {
+			ck.mu.Lock()
+			ck.leaderId = serverId
+			ck.mu.Unlock()
+			DPrintf("ck[%v] get no key", ck.me)
+			break
+		}
+		if reply.Err == OK {
+			ck.mu.Lock()
+			ck.leaderId = serverId
+			ck.mu.Unlock()
+			DPrintf("ck[%v] success get value=%v, args=%v", ck.me, reply.Value, args)
+			return reply.Value
+		}
+	}
+	return ""
 }
 
 // shared by Put and Append.
@@ -56,32 +90,28 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	ck.CmdRequst(&CommandArgs{Key: key, Value: value, Op: op})
-}
-
-func (ck *Clerk) CmdRequst(args *CommandArgs) string {
-
-	args.ClientId = ck.ClientId
-	args.Seq = ck.Seq
-	LeaderId := ck.LeaderId
+	ck.mu.Lock()
+	ck.requestId++
+	ck.mu.Unlock()
+	serverId := ck.leaderId
+	args := PutAppendArgs{key, value, op, ck.me, ck.requestId}
+	DPrintf("ck[%v] send %v rpc..., args=%v,value=%v", ck.me, op, args, value)
 	for {
-		reply := CmdReply{}
-		ok := ck.servers[LeaderId%len(ck.servers)].Call("KVServer.CommandReply", args, &reply)
-		if ok {
-			switch reply.Err {
-			case OK:
-				ck.LeaderId = LeaderId % len(ck.servers)
-				ck.Seq++		
-				return reply.Value
-			case ErrNoKey:
-				ck.LeaderId = LeaderId % len(ck.servers)
-				ck.Seq++
-				return ""
-			}
+		reply := PutAppendReply{}
+		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
+		// DPrintf("ck[%v] resend PutAppend rpc..., args=%v, reply=%v", ck.me, args, reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			serverId = (serverId + 1) % int64(len(ck.servers))
+			continue
 		}
-		LeaderId++
+		if reply.Err == OK {
+			ck.mu.Lock()
+			ck.leaderId = serverId
+			ck.mu.Unlock()
+			DPrintf("ck[%v] success PutAppend keyvalue, args=%v", ck.me, args)
+			return
+		}
 	}
-
 }
 
 func (ck *Clerk) Put(key string, value string) {

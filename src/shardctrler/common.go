@@ -29,19 +29,28 @@ type Config struct {
 }
 
 const (
-	OK          = "OK"
-	WrongLeader = "WrongLeader"
-	//Op
-	Join  = "Join"
-	Move  = "Move"
-	Leave = "Leave"
-	Query = "Query"
+	OK         = "OK"
+	TimeOut    = "TimeOut"
+	NoLeaveGid = "NoLeaveGid"
+)
+
+const (
+	JoinOp  = "Join"
+	LeaveOp = "Leave"
+	MoveOp  = "Move"
+	QueryOp = "Query"
 )
 
 type Err string
 
+type UniqueID struct {
+	ClientId  int64
+	RequestId int
+}
+
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	ID      UniqueID
 }
 
 type JoinReply struct {
@@ -51,6 +60,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+	ID   UniqueID
 }
 
 type LeaveReply struct {
@@ -61,6 +71,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+	ID    UniqueID
 }
 
 type MoveReply struct {
@@ -70,26 +81,11 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+	ID  UniqueID
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
-}
-
-type CmdArgs struct {
-	Servers  map[int][]string //Join
-	GIDs     []int            //leave
-	Shard    int              //Move
-	GID      int              //Move
-	Num      int              //Query
-	Op       string
-	ClientId int64
-	Seq      int
-}
-
-type CmdReply struct {
-	Err    Err
-	Config Config
 }

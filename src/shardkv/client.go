@@ -10,14 +10,21 @@ package shardkv
 
 import (
 	"crypto/rand"
+	"log"
 	"math/big"
-
-	//"strconv"
 	"time"
 
 	"6.5840/labrpc"
 	"6.5840/shardctrler"
 )
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 // which shard is a key in?
 // please use this function,
@@ -43,8 +50,8 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
-	Clientid int64
-	Seq      int
+	clientID  int64
+	requestID int
 }
 
 // the tester calls MakeClerk.
@@ -59,7 +66,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
-	ck.Clientid = nrand()
+	ck.clientID = nrand()
+	ck.requestID = 0
 	return ck
 }
 
@@ -68,12 +76,11 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := CommandArgs{}
-	ck.Seq++
+	args := GetArgs{}
 	args.Key = key
-	args.ClientId = ck.Clientid
-	args.Seq = ck.Seq
-	args.Op = Get
+	ck.requestID++
+	args.RequestID = ck.requestID
+	args.ClientID = ck.clientID
 
 	for {
 		shard := key2shard(key)
@@ -82,14 +89,16 @@ func (ck *Clerk) Get(key string) string {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				var reply CommandReply
-				
+				var reply GetReply
+				DPrintf("ck[%v] send Get to %v, args=%v", ck.clientID, servers[si], args)
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				DPrintf("ck[%v] send Get, args=%v, get res=%v ok=%v", ck.clientID, args, reply, ok)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					
+					DPrintf("ck[%v] Get request deal success, args=%v", ck.clientID, args)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					DPrintf("ck[%v] find ErrWrongGroup of Get, args=%v, curConf.Num=%v, curConf.Shards=%v", ck.clientID, args, ck.config.Num, ck.config.Shards)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -97,9 +106,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-	
 		ck.config = ck.sm.Query(-1)
-	
 	}
 
 	return ""
@@ -108,28 +115,31 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := CommandArgs{}
+	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
 	args.Op = op
-	ck.Seq++
-	args.ClientId = ck.Clientid
-	args.Seq = ck.Seq
+	args.ClientID = ck.clientID
+	ck.requestID++
+	args.RequestID = ck.requestID
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		// DPrintf("ck[%v] cur config:%v", ck.clientID, ck.config)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				var reply CommandReply
-				
+				var reply PutAppendReply
+				DPrintf("ck[%v] send PutAppend op to %v, args=%v", ck.clientID, servers[si], args)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				DPrintf("ck[%v] send PutAppend op to %v, args=%v, get res:%v, ok=%v", ck.clientID, servers[si], args, reply, ok)
 				if ok && reply.Err == OK {
-					
+					DPrintf("ck[%v] PutAppend request deal success, args=%v", ck.clientID, args)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					DPrintf("ck[%v] find ErrWrongGroup of PutAppend, args=%v, curConf.Num=%v, curConf.Shards=%v", ck.clientID, args, ck.config.Num, ck.config.Shards)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -137,9 +147,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-
 		ck.config = ck.sm.Query(-1)
-
 	}
 }
 

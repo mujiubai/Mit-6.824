@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"bytes"
-	
 	"log"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 )
 
 const Debug = false
+const DealTimeOut = 100 //ms 不能设置过大 否则completion after heal (3A) 无法通过，因为没有超时返回ERRWrongLeader, 就不会重新发送请求将值设置为15，导致无法通过
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -22,15 +22,32 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type applyRes struct {
+	Err       Err
+	RequestId int
+	Value     string
+}
+
+type commandEntry struct {
+	op    Op
+	curCh chan applyRes
+}
+
+const (
+	PutOp    = "Put"
+	GetOp    = "Get"
+	AppendOp = "Append"
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Command  string
-	ClientId int64
-	Seq      int
-	Key      string
-	Value    string
+	Operation string
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int
 }
 
 type KVServer struct {
@@ -43,200 +60,240 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	LastApplied  int
-	StateMachine KVStateMachine
-	Client2Seq   map[int64]int
-	Index2Cmd    map[int]chan Op
+	kvDB          map[string]string
+	clientLastReq map[int64]applyRes   //每个客户端记录的最后一个请求
+	applyWaitCh   map[int]commandEntry //raft返回的每个日志对应的通道，用于等待处理完成
+
+	lastApply int
 }
 
-type KVStateMachine interface {
-	Get(key string) (string, Err)
-	Put(key string, value string) Err
-	Append(key string, value string) Err
-}
-
-type KV struct {
-	K2V map[string]string
-}
-
-func (kv *KV) Get(key string) (string, Err) {
-	value, ok := kv.K2V[key]
-	if ok {
-		return value, OK
-	}
-	return "", ErrNoKey
-}
-
-func (KV *KV) Put(key string, value string) Err {
-	KV.K2V[key] = value
-
-	return OK
-}
-
-func (KV *KV) Append(key string, value string) Err {
-	KV.K2V[key] += value
-	return OK
-}
-
-func (kv *KVServer) applyStateMachine(op *Op) {
-	switch op.Command {
-	case "Put":
-	
-		kv.StateMachine.Put(op.Key, op.Value)
-	case "Append":
-	
-		kv.StateMachine.Append(op.Key, op.Value)
-	}
-}
-
-func (kv *KVServer) GetChan(index int) chan Op {
-
-	ch, exist := kv.Index2Cmd[index]
-	if !exist {
-		ch = make(chan Op, 1)
-		kv.Index2Cmd[index] = ch
-	}
-	return ch
-}
-
-func (kv *KVServer) DecodeSnapShot(snapshot []byte) {
-	if snapshot == nil || len(snapshot) < 1 {
-		return
-	}
-	r := bytes.NewBuffer(snapshot)
-	d := labgob.NewDecoder(r)
-	var StateMachine KV
-	//var Index2Cmd map[int] chan Op
-	var Client2Seq map[int64]int
-
-	if d.Decode(&StateMachine) != nil ||
-		d.Decode(&Client2Seq) != nil {
-	} else {
-		kv.StateMachine = &StateMachine
-		kv.Client2Seq = Client2Seq
-	}
-
-}
-
-func (kv *KVServer) PersistSnapShot() []byte {
-
+func (kv *KVServer) getCurSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(kv.StateMachine)
-	e.Encode(kv.Client2Seq)
-	snapshot := w.Bytes()
-	return snapshot
+	if e.Encode(kv.kvDB) != nil || e.Encode(kv.clientLastReq) != nil {
+		return nil
+	}
+	return w.Bytes()
 }
 
-func (kv *KVServer) apply() {
-	for !kv.killed() {
-		select{
-		case ch := <-kv.applyCh:
-		if ch.CommandValid {
-			kv.mu.Lock()
-			if ch.CommandIndex <= kv.LastApplied {
-				kv.mu.Unlock()
-				continue
-			}
-		
-			kv.LastApplied = ch.CommandIndex
-			opchan := kv.GetChan(ch.CommandIndex)
-			op := ch.Command.(Op)
-
-			if kv.Client2Seq[op.ClientId] < op.Seq {
-			
-				kv.applyStateMachine(&op)
-			
-				kv.Client2Seq[op.ClientId] = op.Seq
-			}
-
-			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-				kv.rf.Snapshot(ch.CommandIndex, kv.PersistSnapShot())
-			
-			}
-			kv.mu.Unlock()
-			opchan <- op
-		}
-
-		if ch.SnapshotValid {
-			kv.mu.Lock()
-			if ch.SnapshotIndex > kv.LastApplied {
-				
-				kv.DecodeSnapShot(ch.Snapshot)
-				kv.LastApplied = ch.SnapshotIndex
-			}
-			kv.mu.Unlock()
-		}
-	
-	}
-	}
-
-}
-
-func (kv *KVServer) CommandReply(args *CommandArgs, reply *CmdReply) {
-	if kv.killed() {
-		reply.Err = ErrWrongLeader
+func (kv *KVServer) restoreFromSnapshot(data []byte) {
+	if len(data) == 0 {
 		return
+	}
+	w := bytes.NewBuffer(data)
+	e := labgob.NewDecoder(w)
+	var db map[string]string
+	var clientLastReq map[int64]applyRes
+	if e.Decode(&db) != nil || e.Decode(&clientLastReq) != nil {
+		return
+	} else {
+		kv.kvDB = db
+		kv.clientLastReq = clientLastReq
+	}
+}
+
+func (kv *KVServer) applyLoop() {
+	for message := range kv.applyCh {
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			DPrintf("kv[%v] deal new OP=%v", kv.me, message)
+		}
+
+		var result string
+		if message.SnapshotValid {
+			kv.mu.Lock()
+			//考虑raft底层可能提交较老的快照（这份代码底层会这样）
+			if message.SnapshotIndex > kv.lastApply {
+				kv.lastApply = message.SnapshotIndex
+				kv.restoreFromSnapshot(message.Snapshot)
+				for _, command := range kv.applyWaitCh {
+					command.curCh <- applyRes{ErrWrongLeader, 0, ""}
+				}
+				kv.applyWaitCh = make(map[int]commandEntry)
+			}
+			if isLeader {
+				DPrintf("kv[%v] install from snapData, ", kv.me)
+				DPrintf("kv[%v] ,\nkvDB=%v, \nclientLast=%v", kv.me, kv.kvDB, kv.clientLastReq)
+			}
+			kv.mu.Unlock()
+			continue
+		}
+		if !message.CommandValid {
+			continue
+		}
+
+		if kv.maxraftstate-kv.rf.GetRaftStateSize() <= 2 && kv.maxraftstate > 0 {
+			snapData := kv.getCurSnapshot()
+			kv.rf.Snapshot(kv.lastApply, snapData)
+			if isLeader {
+				DPrintf("kv[%v] success save snapshot", kv.me)
+			}
+		}
+
+		op := message.Command.(Op)
+		kv.mu.Lock()
+		kv.lastApply = message.CommandIndex
+		lastRes := kv.clientLastReq[op.ClientId]
+		if isLeader {
+			DPrintf("kv[%v] lastRes.requestId=%v, op.RequestId=%v", kv.me, lastRes.RequestId, op.RequestId)
+		}
+		if lastRes.RequestId >= op.RequestId {
+			result = lastRes.Value
+			DPrintf("kv[%v] use old reques res, message=%v", kv.me, message)
+			// if isLeader {
+			// 	DPrintf("kv[%v] use old reques res, message=%v", kv.me, message)
+			// }
+		} else {
+			switch op.Operation {
+			case PutOp:
+				kv.kvDB[op.Key] = op.Value
+				if isLeader {
+					DPrintf("kv[%v] deal PutOp success, res=%v", kv.me, kv.kvDB[op.Key])
+				}
+				result = ""
+			case AppendOp:
+				kv.kvDB[op.Key] = kv.kvDB[op.Key] + op.Value
+				if isLeader {
+					DPrintf("kv[%v] deal AppendOp success, res=%v", kv.me, kv.kvDB[op.Key])
+				}
+				result = ""
+			case GetOp:
+				result = kv.kvDB[op.Key]
+				if isLeader {
+					DPrintf("kv[%v] deal GetOp success, res=%v", kv.me, kv.kvDB[op.Key])
+				}
+			}
+			kv.clientLastReq[op.ClientId] = applyRes{OK, op.RequestId, result}
+		}
+		command, ok := kv.applyWaitCh[message.CommandIndex]
+		kv.lastApply = message.CommandIndex
+
+		if ok {
+			delete(kv.applyWaitCh, message.CommandIndex)
+			kv.mu.Unlock()
+			if command.op != op {
+				command.curCh <- applyRes{ErrWrongLeader, op.RequestId, result}
+			} else {
+				DPrintf("kv[%v] test1, op=%v", kv.me, op)
+				command.curCh <- applyRes{OK, op.RequestId, result}
+				DPrintf("kv[%v] test2, op=%v", kv.me, op)
+			}
+		} else {
+			if isLeader {
+				DPrintf("kv[%v] dont get chan from hashtable", kv.me)
+			}
+			kv.mu.Unlock()
+		}
 	}
 	kv.mu.Lock()
-
-	if args.Op != "Get" && kv.Client2Seq[args.ClientId] >= args.Seq {
-		reply.Err = OK
-		kv.mu.Unlock()
-		return
+	defer kv.mu.Unlock()
+	for _, tmp := range kv.applyWaitCh {
+		close(tmp.curCh)
 	}
-
-	//t := time.Time{}
-	//t = time.Now()
-	op := Op{
-		Key:      args.Key,
-		Value:    args.Value,
-		Command:  args.Op,
-		Seq:      args.Seq,
-		ClientId: args.ClientId,
-	}
-	index, _, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		
-		kv.mu.Unlock()
-		return
-	}
-	ch := kv.GetChan(index)
-	kv.mu.Unlock()
-
-	select {
-	case app := <-ch:
-		if app.ClientId == op.ClientId && app.Seq == op.Seq {
-			if args.Op == "Get" {
-				kv.mu.Lock()
-				reply.Value, reply.Err = kv.StateMachine.Get(app.Key)
-				kv.mu.Unlock()
-			}
-	
-			reply.Err = OK
-		} else {
-			reply.Err = TimeOut
-		}
-
-	case <-time.After(time.Millisecond * 33):
-		reply.Err = TimeOut
-	}
-
-	go func() {
-		kv.mu.Lock()
-		delete(kv.Index2Cmd, index)
-		kv.mu.Unlock()
-	}()
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		DPrintf("kv[%v] is killed, return ErrWrongLeader", kv.me)
+		return
+	}
+	op := Op{GetOp, args.Key, "", args.ClientId, args.RequestId}
+	kv.mu.Lock()
+	index, term, isLeader := kv.rf.Start(op)
+	if term == 0 {
+		kv.mu.Unlock()
+		reply.Err = ErrNoKey
+		return
+	}
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		// DPrintf("kv[%v] is not a leader, return ErrWrongLeader", kv.me)
+		return
+	}
 
+	DPrintf("kv[%v] start deal get, op=%v", kv.me, op)
+
+	curCh := make(chan applyRes)
+	command := commandEntry{op, curCh}
+	kv.applyWaitCh[index] = command
+	kv.mu.Unlock()
+
+	for !kv.killed() {
+		select {
+		case res := <-curCh:
+			reply.Err = res.Err
+			reply.Value = res.Value
+			if res.Err == OK {
+				if res.Value == "" {
+					res.Err = ErrNoKey
+				}
+			}
+			return
+		case <-time.After(time.Duration(DealTimeOut) * time.Millisecond):
+			go func() { <-curCh }() //需要接受处理结果，否则applyloop会死等
+			reply.Err = ErrWrongLeader
+			DPrintf("kv[%v] timeout, return ErrWrongLeader", kv.me)
+			return
+		}
+	}
+	//当kv crash时
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		DPrintf("kv[%v] is killed, return ErrWrongLeader", kv.me)
+		return
+	}
+	op := Op{args.Op, args.Key, args.Value, args.ClientId, args.RequestId}
+	kv.mu.Lock()
+	index, term, isLeader := kv.rf.Start(op)
+	if term == 0 {
+		kv.mu.Unlock()
+		reply.Err = ErrNoKey
+		return
+	}
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		// DPrintf("kv[%v] is not a leader, return ErrWrongLeader", kv.me)
+		return
+	}
+
+	DPrintf("kv[%v] start deal PutAppend, op=%v", kv.me, op)
+
+	curCh := make(chan applyRes)
+	command := commandEntry{op, curCh}
+	kv.applyWaitCh[index] = command
+	kv.mu.Unlock()
+
+	for !kv.killed() {
+
+		select {
+		case res := <-curCh:
+			reply.Err = res.Err
+			return
+		case <-time.After(time.Duration(DealTimeOut) * time.Millisecond):
+			go func() { <-curCh }() //需要接受处理结果，否则applyloop会死等
+			DPrintf("kv[%v] timeout, return ErrWrongLeader", kv.me)
+			reply.Err = ErrWrongLeader
+			return
+		}
+	}
+
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -281,19 +338,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
+	kv.kvDB = make(map[string]string)
+	kv.applyWaitCh = make(map[int]commandEntry)
+	kv.clientLastReq = make(map[int64]applyRes)
+
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.Client2Seq = make(map[int64]int)
-	kv.Index2Cmd = make(map[int]chan Op)
-	kv.StateMachine = &KV{make(map[string]string)}
 
-	snapshot := persister.ReadSnapshot()
-	if len(snapshot) > 0 {
-		kv.DecodeSnapShot(snapshot)
-	}
-
-	go kv.apply()
+	kv.lastApply = kv.rf.Lastindex
+	kv.restoreFromSnapshot(persister.ReadSnapshot())
+	DPrintf("kv[%v] create success and restore from snapdata", kv.me)
 	// You may need initialization code here.
+	go kv.applyLoop()
 
 	return kv
 }

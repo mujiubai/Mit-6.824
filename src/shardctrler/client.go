@@ -7,16 +7,19 @@ package shardctrler
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 	"time"
 
 	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
-	ClientId int64
-	Seq      int
+	clientId  int64
+	requestId int
+	mu        sync.Mutex
 }
 
 func nrand() int64 {
@@ -30,48 +33,51 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
-	ck.ClientId = nrand()
-
+	ck.clientId = nrand()
+	ck.requestId = 0
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &CmdArgs{}
+	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
-	args.Op = Query
-	args.ClientId = ck.ClientId
-	ck.Seq++
-	args.Seq = ck.Seq
+	ck.mu.Lock()
+	ck.requestId++
+	args.ID.RequestId = ck.requestId
+	ck.mu.Unlock()
+	args.ID.ClientId = ck.clientId
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply CmdReply
-
+			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.Err != WrongLeader {
+			if ok && reply.WrongLeader == false {
+				raft.DPrintf("ck[%v] deal Query success, Num=%v", ck.clientId, args.Num)
 				return reply.Config
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &CmdArgs{}
+	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
-	args.Op = Join
-	args.ClientId = ck.ClientId
-	ck.Seq++
-	args.Seq = ck.Seq
+	ck.mu.Lock()
+	ck.requestId++
+	args.ID.RequestId = ck.requestId
+	ck.mu.Unlock()
+	args.ID.ClientId = ck.clientId
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply CmdReply
+			var reply JoinReply
 			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.Err != WrongLeader {
+			if ok && reply.WrongLeader == false {
+				raft.DPrintf("ck[%v] deal Join success, servers=%v", ck.clientId, args.Servers)
 				return
 			}
 		}
@@ -80,19 +86,22 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &CmdArgs{}
+	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
-	args.Op = Leave
-	args.ClientId = ck.ClientId
-	ck.Seq++
-	args.Seq = ck.Seq
+	ck.mu.Lock()
+	ck.requestId++
+	args.ID.RequestId = ck.requestId
+	ck.mu.Unlock()
+	args.ID.ClientId = ck.clientId
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply CmdReply
+			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.Err != WrongLeader {
+			if ok && reply.WrongLeader == false {
+				raft.DPrintf("ck[%v] deal Leave success, GIDs=%v", ck.clientId, args.GIDs)
 				return
 			}
 		}
@@ -101,20 +110,22 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &CmdArgs{}
+	args := &MoveArgs{}
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-	args.Op = Move
-	args.ClientId = ck.ClientId
-	ck.Seq++
-	args.Seq = ck.Seq
+	ck.mu.Lock()
+	ck.requestId++
+	args.ID.RequestId = ck.requestId
+	ck.mu.Unlock()
+	args.ID.ClientId = ck.clientId
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply CmdReply
+			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.Err != WrongLeader {
+			if ok && reply.WrongLeader == false {
 				return
 			}
 		}

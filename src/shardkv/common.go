@@ -1,5 +1,7 @@
 package shardkv
 
+import "time"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -14,12 +16,24 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrShutDown    = "ErrShutDown"
+	ErrShardEmpty  = "ErrShardEmpty"
+	ErrRepeatReq   = "ErrRepeatReq"
+	ErrShardData   = "ErrShardData"
 )
 
 const (
-	Put    = "Put"
-	Append = "Append"
-	Get    = "Get"
+	Put             = "Put"
+	Append          = "Append"
+	Get             = "Get"
+	UpdateConfig    = "UpdateConfig"
+	DeleteShardData = "DeleteShardData"
+	UpShardData     = "UpShardData"
+)
+
+const (
+	WaitChTimeout    = time.Duration(100) * time.Millisecond //ms
+	UpConfigInterval = time.Duration(80) * time.Millisecond  //ms
 )
 
 type Err string
@@ -33,6 +47,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientID  int64
+	RequestID int
 }
 
 type PutAppendReply struct {
@@ -42,6 +58,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClientID  int64
+	RequestID int
 }
 
 type GetReply struct {
@@ -49,15 +67,13 @@ type GetReply struct {
 	Value string
 }
 
-type CommandArgs struct {
-	Key      string
-	Value    string
-	Op       string
-	Seq      int
-	ClientId int64
+type SendShardArgs struct {
+	ShardID       int
+	DB            ShardDB
+	ClientLastReq map[int64]LastReqRes
 }
 
-type CommandReply struct {
-	Err   Err
-	Value string
+type SendShardReply struct {
+	Err          Err
+	ShardConfNum int
 }
